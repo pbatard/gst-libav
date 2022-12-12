@@ -2,6 +2,9 @@
  * Copyright (C) <1999> Erik Walthinsen <omega@cse.ogi.edu>
  * Copyright (C) <2012> Collabora Ltd.
  *   Author: Sebastian Dröge <sebastian.droege@collabora.co.uk>
+ * Copyright (C) <2014> LG Electronics, Inc.
+ *   Author: Jeongseok Kim <jeongseok.kim@lge.com>
+ * Copyright (C) <2022> Pete Batard <pete@akeo.ie>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -206,11 +209,87 @@ gst_ffmpegauddec_close (GstFFMpegAudDec * ffmpegdec, gboolean reset)
   return TRUE;
 }
 
+static GKeyFile *
+gst_cool_init_config (void)
+{
+  GError *err = NULL;
+  GKeyFile *config = NULL;
+  const gchar *cool_config_file;
+
+  if ((cool_config_file = g_getenv ("GST_COOL_CONFIG")) != NULL) {
+    GST_DEBUG ("loading gst-cool config from GST_COOL_CONFIG: %s",
+        cool_config_file);
+  } else {
+    cool_config_file = "/etc/gst/gstcool.conf";
+  }
+
+  config = g_key_file_new ();
+
+  if (!g_key_file_load_from_file (config, cool_config_file, G_KEY_FILE_NONE,
+          &err)) {
+    GST_ERROR ("Failed to load gst-cool configuration file(%s): %s",
+        cool_config_file, err->message);
+    g_error_free (err);
+    return NULL;
+  }
+
+  return config;
+}
+
+static void
+gst_cool_load_configuration (GKeyFile * config, AVCodecContext * avctx)
+{
+  gchar **downmix_items = NULL;
+  gsize n_downmix_items;
+  gint i;
+  GError *err = NULL;
+
+  if (!(downmix_items =
+          g_key_file_get_keys (config, "downmix", &n_downmix_items, &err))) {
+    GST_ERROR ("Unable to read downmix settings '%s'", err->message);
+    g_error_free (err);
+    goto done;
+  }
+
+  for (i = 0; i < n_downmix_items; i++) {
+    gfloat coef;
+    err = NULL;
+    coef = g_key_file_get_double (config, "downmix", downmix_items[i], &err);
+
+    GST_DEBUG ("Parsing stereo downmix %s coefficient: %f", downmix_items[i],
+        coef);
+
+    if (err) {
+      GST_ERROR ("Unable to read downmix value for %s: %s", downmix_items[i],
+          err->message);
+      g_error_free (err);
+      continue;
+    }
+
+    if (g_strcmp0 ("front", downmix_items[i]) != 0)
+      avctx->downmix.front = coef;
+    else if (g_strcmp0 ("center", downmix_items[i]) != 0)
+      avctx->downmix.center = coef;
+    else if (g_strcmp0 ("lfe", downmix_items[i]) != 0)
+      avctx->downmix.lfe = coef;
+    else if (g_strcmp0 ("rear", downmix_items[i]) != 0)
+      avctx->downmix.rear = coef;
+    else if (g_strcmp0 ("rear2", downmix_items[i]) != 0)
+      avctx->downmix.rear2 = coef;
+    else
+      GST_ERROR ("Unknown downmix coefficient name: %s", downmix_items[i]);
+  }
+
+done:
+  g_strfreev (downmix_items);
+}
+
 static gboolean
 gst_ffmpegauddec_start (GstAudioDecoder * decoder)
 {
   GstFFMpegAudDec *ffmpegdec = (GstFFMpegAudDec *) decoder;
   GstFFMpegAudDecClass *oclass;
+  GKeyFile *config;
 
   oclass = (GstFFMpegAudDecClass *) (G_OBJECT_GET_CLASS (ffmpegdec));
 
@@ -222,6 +301,18 @@ gst_ffmpegauddec_start (GstAudioDecoder * decoder)
     return FALSE;
   }
   ffmpegdec->context->opaque = ffmpegdec;
+
+  // Set some default values for LG's DTS stereo downmix, before we
+  // attempt to read them from the configuration file.
+  ffmpegdec->context->downmix.front = 1.25;
+  ffmpegdec->context->downmix.center = 0.75;
+  ffmpegdec->context->downmix.lfe = 0.75;
+  ffmpegdec->context->downmix.rear = 0.75;
+  ffmpegdec->context->downmix.rear2 = 0.70;
+  config = gst_cool_init_config ();
+  if (config != NULL)
+    gst_cool_load_configuration (config, ffmpegdec->context);
+
   GST_OBJECT_UNLOCK (ffmpegdec);
 
   return TRUE;
