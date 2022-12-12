@@ -1,0 +1,163 @@
+From 6a97ba521558ce131fe839eed2d51ff745280e1d Mon Sep 17 00:00:00 2001
+From: Pete Batard <pete@akeo.ie>
+Date: Mon, 12 Dec 2022 20:49:42 +0000
+Subject: [PATCH] avcodec/dca: Force stereo downmix and integer output for LG
+ TVs
+
+---
+ libavcodec/avcodec.h  | 14 +++++++++++++
+ libavcodec/dca_core.c |  5 +++++
+ libavcodec/dca_xll.c  |  7 +++++++
+ libavcodec/dcadec.c   | 49 +++++++++++++++++++++++++++++++++++++++++++
+ libavcodec/dcadec.h   |  2 ++
+ 5 files changed, 77 insertions(+)
+
+diff --git a/libavcodec/avcodec.h b/libavcodec/avcodec.h
+index 18c3e3ea1e..6cabf4f136 100644
+--- a/libavcodec/avcodec.h
++++ b/libavcodec/avcodec.h
+@@ -1745,6 +1745,14 @@ enum AVFieldOrder {
+     AV_FIELD_BT,          //< Bottom coded first, top displayed first
+ };
+ 
++typedef struct {
++    float front;
++    float center;
++    float lfe;
++    float rear;
++    float rear2;
++} AVDownmix;
++
+ /**
+  * main external API structure.
+  * New fields can be added to the end with minor version bumps.
+@@ -3702,6 +3710,12 @@ typedef struct AVCodecContext {
+      * (with the display dimensions being determined by the crop_* fields).
+      */
+     int apply_cropping;
++
++    /**
++      * Coefficients for forced stereo downmix.
++      * Required to restore DTS support on LG TVs.
++      */
++    AVDownmix downmix;
+ } AVCodecContext;
+ 
+ AVRational av_codec_get_pkt_timebase         (const AVCodecContext *avctx);
+diff --git a/libavcodec/dca_core.c b/libavcodec/dca_core.c
+index accc5efd51..f390c61bc8 100644
+--- a/libavcodec/dca_core.c
++++ b/libavcodec/dca_core.c
+@@ -2145,6 +2145,11 @@ static int filter_frame_fixed(DCACoreDecoder *s, AVFrame *frame)
+                                        s->output_samples,
+                                        s->prim_dmix_coeff,
+                                        nsamples, s->ch_mask);
++    } else if (DCA_HAS_STEREO(s->ch_mask)) {
++        // LG's default audiosink says it's multichannel, but it only outputs
++        // stereo so we force a downmix regardless.
++        ff_dca_downmix_to_stereo_forced(s->dcadsp, avctx, s->output_samples,
++                                        nsamples, s->ch_mask);
+     }
+ 
+     for (i = 0; i < avctx->channels; i++) {
+diff --git a/libavcodec/dca_xll.c b/libavcodec/dca_xll.c
+index d265cab8df..09ba981e54 100644
+--- a/libavcodec/dca_xll.c
++++ b/libavcodec/dca_xll.c
+@@ -1439,6 +1439,13 @@ int ff_dca_xll_filter_frame(DCAXllDecoder *s, AVFrame *frame)
+         ff_dca_downmix_to_stereo_fixed(s->dcadsp, s->output_samples,
+                                        p->dmix_coeff, nsamples,
+                                        s->output_mask);
++    } else if (DCA_HAS_STEREO(s->output_mask)) {
++        // LG's default audiosink says it's multichannel, but it only outputs stereo
++        // so we must force a downmix. And we can't really use the call above because
++        // it requires downmix coefficients to be provided by the DTS stream, which
++        // very few streams actually do...
++        ff_dca_downmix_to_stereo_forced(s->dcadsp, avctx, s->output_samples,
++                                        nsamples, s->output_mask);
+     }
+ 
+     for (i = 0; i < avctx->channels; i++) {
+diff --git a/libavcodec/dcadec.c b/libavcodec/dcadec.c
+index 4146a85ec5..e3ff074fb6 100644
+--- a/libavcodec/dcadec.c
++++ b/libavcodec/dcadec.c
+@@ -107,6 +107,48 @@ void ff_dca_downmix_to_stereo_fixed(DCADSPContext *dcadsp, int32_t **samples,
+     }
+ }
+ 
++void ff_dca_downmix_to_stereo_forced(DCADSPContext *dcadsp, AVCodecContext *avctx,
++                                     int32_t **samples, int nsamples, int ch_mask)
++{
++    static const float base_value = UINT16_MAX / 2;
++    int spkr, max_spkr = av_log2(ch_mask);
++
++    av_assert0(DCA_HAS_STEREO(ch_mask));
++
++    for (spkr = 0; spkr <= max_spkr; spkr++) {
++        if (!(ch_mask & (1U << spkr)))
++            continue;
++        switch(1U << spkr) {
++        case DCA_SPEAKER_MASK_L:
++           dcadsp->dmix_scale(samples[DCA_SPEAKER_L], avctx->downmix.front * base_value, nsamples);
++           break;
++        case DCA_SPEAKER_MASK_R:
++           dcadsp->dmix_scale(samples[DCA_SPEAKER_R], avctx->downmix.front * base_value, nsamples);
++           break;
++        case DCA_SPEAKER_MASK_C:
++            dcadsp->dmix_add(samples[DCA_SPEAKER_L], samples[spkr], avctx->downmix.center * base_value, nsamples);
++            dcadsp->dmix_add(samples[DCA_SPEAKER_R], samples[spkr], avctx->downmix.center * base_value, nsamples);
++            break;
++        case DCA_SPEAKER_MASK_LFE1:
++            dcadsp->dmix_add(samples[DCA_SPEAKER_L], samples[spkr], avctx->downmix.lfe * base_value, nsamples);
++            dcadsp->dmix_add(samples[DCA_SPEAKER_R], samples[spkr], avctx->downmix.lfe * base_value, nsamples);
++            break;
++        case DCA_SPEAKER_MASK_Ls:
++           dcadsp->dmix_add(samples[DCA_SPEAKER_L], samples[spkr], avctx->downmix.rear * base_value, nsamples);
++           break;
++        case DCA_SPEAKER_MASK_Rs:
++           dcadsp->dmix_add(samples[DCA_SPEAKER_R], samples[spkr], avctx->downmix.rear * base_value, nsamples);
++           break;
++        case DCA_SPEAKER_MASK_Lsr:
++           dcadsp->dmix_add(samples[DCA_SPEAKER_L], samples[spkr], avctx->downmix.rear2 * base_value, nsamples);
++           break;
++        case DCA_SPEAKER_MASK_Rsr:
++           dcadsp->dmix_add(samples[DCA_SPEAKER_R], samples[spkr], avctx->downmix.rear2 * base_value, nsamples);
++           break;
++        }
++    }
++}
++
+ void ff_dca_downmix_to_stereo_float(AVFloatDSPContext *fdsp, float **samples,
+                                     int *coeff_l, int nsamples, int ch_mask)
+ {
+@@ -343,6 +385,13 @@ static av_cold int dcadec_init(AVCodecContext *avctx)
+ 
+     s->crctab = av_crc_get_table(AV_CRC_16_CCITT);
+ 
++    // LG's default audiosink says it's multichannel, but it only outputs stereo...
++    if (avctx->channels > 2)
++        avctx->request_channel_layout = AV_CH_LAYOUT_STEREO_DOWNMIX;
++
++    // Also force integer output for LG as the default audosink can't handle float.
++    avctx->flags |= AV_CODEC_FLAG_BITEXACT;
++
+     switch (avctx->request_channel_layout & ~AV_CH_LAYOUT_NATIVE) {
+     case 0:
+         s->request_channel_layout = 0;
+diff --git a/libavcodec/dcadec.h b/libavcodec/dcadec.h
+index 9da8d3b444..44757bf93c 100644
+--- a/libavcodec/dcadec.h
++++ b/libavcodec/dcadec.h
+@@ -71,6 +71,8 @@ void ff_dca_downmix_to_stereo_fixed(DCADSPContext *dcadsp, int32_t **samples,
+                                     int *coeff_l, int nsamples, int ch_mask);
+ void ff_dca_downmix_to_stereo_float(AVFloatDSPContext *fdsp, float **samples,
+                                     int *coeff_l, int nsamples, int ch_mask);
++void ff_dca_downmix_to_stereo_forced(DCADSPContext *dcadsp, AVCodecContext *avctx,
++                                    int32_t **samples, int nsamples, int ch_mask);
+ 
+ static inline int ff_dca_check_crc(AVCodecContext *avctx, GetBitContext *s,
+                                    int p1, int p2)
+-- 
+2.36.0.windows.1
+
